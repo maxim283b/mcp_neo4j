@@ -1,63 +1,54 @@
 import asyncio
 import os
 import logging
-from typing import List, Dict, Any, Literal
+from typing import List, Dict, Any, Optional, Literal
 
-import dotenv
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field, ConfigDict
-from rapidfuzz import fuzz
 from neo4j import GraphDatabase
+from rapidfuzz import fuzz
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
-from typing import Optional
 
 
 # =========================
-# ЗАГРУЗКА ENV
-# =========================
-
-load_status = dotenv.load_dotenv(
-    "/Users/maksi/Desktop/работа/mcp/онтология/mcp-serverNEO4J/Neo4j-aa1242b2-Created-2025-11-27.txt"
-)
-if not load_status:
-    raise RuntimeError("Environment variables not loaded.")
-
-URI = os.getenv("NEO4J_URI")
-AUTH = (os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD"))
-
-# =========================
-# ЛОГИРОВАНИЕ
+# LOGGING
 # =========================
 logger = logging.getLogger("neo4j_mcp_server")
 logger.setLevel(logging.INFO)
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-logger.addHandler(console)
+handler = logging.StreamHandler()
+handler.setLevel(logging.INFO)
+logger.addHandler(handler)
 
 # =========================
-# ПОДКЛЮЧЕНИЕ NEO4J
-# =========================
-driver = GraphDatabase.driver(URI, auth=AUTH)
-with driver.session() as session:
-    session.run("RETURN 1")
-logger.info("Connected to Neo4j")
-
-# =========================
-# MCP
+# MCP APP (must be top-level)
 # =========================
 mcp = FastMCP("neo4j-mcp")
-logger.info("Neo4j MCP server created")
 
 # =========================
-# MODELS
+# NEO4J (lazy init - NO network on import)
 # =========================
-class SearchRequest(BaseModel):
-    # КЛЮЧЕВОЕ: игнорируем все неизвестные поля (n8n / AI Agent)
-    model_config = ConfigDict(extra="ignore")
+_driver = None
 
-    keywords: List[str] = Field(default_factory=list)
-    limit: int = Field(default=10)
+def get_driver():
+    """
+    Lazy driver init: called only when a tool is invoked.
+    This avoids failing build/inspect in cloud environments.
+    """
+    global _driver
+    if _driver is None:
+        uri = os.getenv("NEO4J_URI")
+        user = os.getenv("NEO4J_USER", "neo4j")
+        password = os.getenv("NEO4J_PASSWORD")
+
+        if not uri:
+            raise RuntimeError("Missing env var: NEO4J_URI")
+        if not password:
+            raise RuntimeError("Missing env var: NEO4J_PASSWORD")
+
+        _driver = GraphDatabase.driver(uri, auth=(user, password))
+        logger.info("Neo4j driver initialized")
+    return _driver
+
 
 # =========================
 # HELPERS
@@ -69,7 +60,8 @@ def normalize_keywords(keywords: Any) -> List[str]:
         return [k.strip() for k in keywords.split(",") if k.strip()]
     if isinstance(keywords, list):
         return [str(k).strip() for k in keywords if str(k).strip()]
-    return [str(keywords).strip()] if str(keywords).strip() else []
+    s = str(keywords).strip()
+    return [s] if s else []
 
 def normalize_limit(limit: Any, default: int = 10) -> int:
     try:
@@ -77,6 +69,7 @@ def normalize_limit(limit: Any, default: int = 10) -> int:
     except Exception:
         v = default
     return max(1, min(v, 50))
+
 
 # =========================
 # CORE LOGIC
@@ -97,7 +90,9 @@ def fetch_graph_data() -> List[Dict[str, Any]]:
         COALESCE(p.Tags, []) AS param_tags
     """
 
-    rows = []
+    driver = get_driver()
+    rows: List[Dict[str, Any]] = []
+
     with driver.session() as session:
         result = session.run(query)
         for record in result:
@@ -112,10 +107,12 @@ def fetch_graph_data() -> List[Dict[str, Any]]:
 
             rows.append({
                 "command_id": record["command_id"],
-                "command_props": record["command_props"],   # <-- ВСЕ Properties узла :commands
-                "text": text_content
+                "command_props": record["command_props"],
+                "text": text_content,
             })
+
     return rows
+
 
 def score_commands(rows: List[Dict[str, Any]], keywords: List[str]) -> List[Dict[str, Any]]:
     scored: Dict[str, Dict[str, Any]] = {}
@@ -146,11 +143,10 @@ def score_commands(rows: List[Dict[str, Any]], keywords: List[str]) -> List[Dict
 # =========================
 @mcp.tool(description="Search commands in Neo4j by keywords or tags")
 async def search_commands(
-    # то, что реально нужно
     keywords: Optional[List[str]] = None,
     limit: int = 10,
 
-    # лишние поля, которые шлёт n8n AI Agent / MCP Client (мы их просто игнорируем)
+    # extra fields that some clients (e.g. n8n) may send — we ignore
     request: Optional[str] = None,
     sessionId: Optional[str] = None,
     action: Optional[str] = None,
@@ -158,22 +154,10 @@ async def search_commands(
     toolCallId: Optional[str] = None,
     tool: Optional[str] = None,
 ):
-    """
-    Совместимо с fastmcp (без **kwargs) и устойчиво к n8n,
-    который присылает служебные поля sessionId/action/chatInput/toolCallId.
-    """
-
-    # 1) Нормализуем keywords
-    # Если keywords не пришли, но пришло поле request (например "дебит"), используем его как fallback.
-    if not keywords or (isinstance(keywords, list) and len(keywords) == 0):
-        if request:
-            keywords = normalize_keywords(request)
-        else:
-            keywords = []
-
+    # fallback: if keywords missing, but request provided
+    if not keywords:
+        keywords = normalize_keywords(request) if request else []
     keywords = normalize_keywords(keywords)
-
-    # 2) Нормализуем limit
     limit = normalize_limit(limit, default=10)
 
     if not keywords:
@@ -181,18 +165,18 @@ async def search_commands(
 
     rows = await asyncio.to_thread(fetch_graph_data)
     scored = await asyncio.to_thread(score_commands, rows, keywords)
-    top = scored[:limit]
+    return {"keywords": keywords, "matched_commands": scored[:limit]}
 
-    return {"keywords": keywords, "matched_commands": top}
+
 # =========================
 # SERVER START
 # =========================
 async def main(
     transport: Literal["http", "stdio", "sse"] = "http",
     host: str = "0.0.0.0",
-    port: int = 3344,
+    port: int = int(os.getenv("PORT", "8080")),
     path: str = "/mcp/",
-    allow_origins: List[str] = [],
+    allow_origins: Optional[List[str]] = None,
 ):
     middleware = [
         Middleware(
@@ -203,28 +187,16 @@ async def main(
         )
     ]
 
-    logger.info(f"Starting Neo4j MCP server on {host}:{port}{path} with transport {transport}")
+    logger.info(f"Starting MCP on {host}:{port}{path} transport={transport}")
 
-    match transport:
-        case "http":
-            await mcp.run_http_async(
-                host=host,
-                port=port,
-                path=path,
-                middleware=middleware
-            )
-        case "stdio":
-            await mcp.run_stdio_async()
-        case "sse":
-            await mcp.run_http_async(
-                host=host,
-                port=port,
-                path=path,
-                middleware=middleware,
-                transport="sse"
-            )
-        case _:
-            raise ValueError(f"Unsupported transport: {transport}")
+    if transport == "http":
+        await mcp.run_http_async(host=host, port=port, path=path, middleware=middleware)
+    elif transport == "stdio":
+        await mcp.run_stdio_async()
+    elif transport == "sse":
+        await mcp.run_http_async(host=host, port=port, path=path, middleware=middleware, transport="sse")
+    else:
+        raise ValueError(f"Unsupported transport: {transport}")
 
 if __name__ == "__main__":
     asyncio.run(main())
