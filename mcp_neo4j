@@ -17,8 +17,14 @@ from typing import Optional
 # ЗАГРУЗКА ENV
 # =========================
 
-URI = neo4j+s://aa1242b2.databases.neo4j.io
-AUTH = neo4j, h4hTFDS8eDQRt_Yjg5B0xpco7i8xAoue21YONK7fcU8
+load_status = dotenv.load_dotenv(
+    "/Users/maksi/Desktop/работа/mcp/онтология/mcp-serverNEO4J/Neo4j-aa1242b2-Created-2025-11-27.txt"
+)
+if not load_status:
+    raise RuntimeError("Environment variables not loaded.")
+
+URI = os.getenv("NEO4J_URI")
+AUTH = (os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD"))
 
 # =========================
 # ЛОГИРОВАНИЕ
