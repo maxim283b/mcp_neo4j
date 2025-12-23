@@ -3,20 +3,12 @@ import os
 import logging
 from typing import List, Dict, Any, Literal, Optional, Tuple
 
-import dotenv
 from fastmcp import FastMCP
 from rapidfuzz import fuzz
-from neo4j import GraphDatabase
+from neo4j import GraphDatabase, Driver
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 
-
-# =========================
-# ENV
-# =========================
-
-URI = os.getenv("NEO4J_URI")
-AUTH = (os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD"))
 
 # =========================
 # LOGGING
@@ -26,18 +18,48 @@ logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler())
 
 # =========================
-# NEO4J
-# =========================
-driver = GraphDatabase.driver(URI, auth=AUTH)
-with driver.session() as s:
-    s.run("RETURN 1")
-logger.info("Connected to Neo4j")
-
-# =========================
-# MCP
+# MCP (MUST be top-level)
 # =========================
 mcp = FastMCP("neo4j-mcp")
-logger.info("MCP server created")
+logger.info("MCP server object created")
+
+
+# =========================
+# NEO4J (LAZY INIT — NO NETWORK ON IMPORT)
+# =========================
+_driver: Optional[Driver] = None
+
+def get_driver() -> Driver:
+    """
+    Create Neo4j driver only when a tool is actually called.
+    This avoids FastMCP Cloud build/inspect/pre-flight DNS/network failures.
+    """
+    global _driver
+    if _driver is not None:
+        return _driver
+
+    uri = os.getenv("NEO4J_URI")
+    password = os.getenv("NEO4J_PASSWORD")
+    user = os.getenv("NEO4J_USER") or os.getenv("NEO4J_USERNAME") or "neo4j"
+
+    if not uri:
+        raise RuntimeError("Missing env var: NEO4J_URI")
+    if not password:
+        raise RuntimeError("Missing env var: NEO4J_PASSWORD")
+
+    # IMPORTANT: do NOT test connection here (no session.run on init)
+    _driver = GraphDatabase.driver(uri, auth=(user, password))
+    logger.info("Neo4j driver initialized (lazy)")
+    return _driver
+
+def close_driver():
+    global _driver
+    if _driver is not None:
+        try:
+            _driver.close()
+        except Exception:
+            pass
+        _driver = None
 
 
 # =========================
@@ -53,7 +75,6 @@ def normalize_keywords(val: Any) -> List[str]:
     s = str(val).strip()
     return [s] if s else []
 
-
 def normalize_limit(limit: Any, default: int = 10) -> int:
     try:
         v = int(limit)
@@ -61,17 +82,16 @@ def normalize_limit(limit: Any, default: int = 10) -> int:
         v = default
     return max(1, min(v, 50))
 
-
 def _run(query: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    driver = get_driver()
     with driver.session() as s:
         return [r.data() for r in s.run(query, params)]
 
 
 # =========================
-#SEARCH COMMANDS
+# SEARCH COMMANDS
 # =========================
 def fetch_commands_for_search() -> List[Dict[str, Any]]:
-    # (steps)-[:has_command]->(commands)-[:has_params]->(Params)
     query = """
     MATCH (c:commands)
     OPTIONAL MATCH (s:steps)-[:has_command]->(c)
@@ -86,6 +106,7 @@ def fetch_commands_for_search() -> List[Dict[str, Any]]:
       COALESCE(s.Tags, []) AS step_tags,
       COALESCE(p.Tags, []) AS param_tags
     """
+
     rows: List[Dict[str, Any]] = []
     for r in _run(query, {}):
         text = " ".join(
@@ -106,7 +127,6 @@ def fetch_commands_for_search() -> List[Dict[str, Any]]:
             }
         )
     return rows
-
 
 def score_commands(rows: List[Dict[str, Any]], keywords: List[str]) -> List[Dict[str, Any]]:
     scored: Dict[str, Dict[str, Any]] = {}
@@ -130,7 +150,6 @@ def score_commands(rows: List[Dict[str, Any]], keywords: List[str]) -> List[Dict
     out = list(scored.values())
     out.sort(key=lambda x: x["score"], reverse=True)
     return out
-
 
 @mcp.tool(description="Search commands by keywords")
 async def search_commands(
@@ -159,7 +178,7 @@ async def search_commands(
 
 
 # =========================
-#BUILD PREREQUISITE STEP CHAIN
+# BUILD PREREQUISITE STEP CHAIN
 # =========================
 def get_step_for_command(command_id: str) -> Optional[Dict[str, Any]]:
     q = """
@@ -170,7 +189,6 @@ def get_step_for_command(command_id: str) -> Optional[Dict[str, Any]]:
     """
     rows = _run(q, {"cid": command_id})
     return rows[0] if rows else None
-
 
 def get_commands_for_step(step_id: str) -> List[Dict[str, Any]]:
     q = """
@@ -189,9 +207,7 @@ def get_commands_for_step(step_id: str) -> List[Dict[str, Any]]:
         r["params"] = [x for x in (r.get("params") or []) if x is not None]
     return rows
 
-
 def get_requires(step_props: Dict[str, Any]) -> List[str]:
-    # поддерживаем requires / require
     req = step_props.get("requires")
     if req is None:
         req = step_props.get("require")
@@ -205,9 +221,7 @@ def get_requires(step_props: Dict[str, Any]) -> List[str]:
     s = str(req).strip()
     return [s] if s else []
 
-
 def get_producers(flag: str) -> List[Dict[str, Any]]:
-    # поддерживаем Produces / produces
     q = """
     MATCH (s:steps)
     WHERE $flag IN COALESCE(s.Produces, []) OR $flag IN COALESCE(s.produces, [])
@@ -215,12 +229,7 @@ def get_producers(flag: str) -> List[Dict[str, Any]]:
     """
     return _run(q, {"flag": flag})
 
-
 def build_chain(step_id: str, step_props: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
-    """
-    Возвращает упорядоченную цепочку:
-      все producer-steps для requires -> затем текущий step
-    """
     visited = set()
     ordered: List[Tuple[str, Dict[str, Any]]] = []
 
@@ -238,7 +247,6 @@ def build_chain(step_id: str, step_props: Dict[str, Any]) -> List[Tuple[str, Dic
     dfs(step_id, step_props)
     return ordered
 
-
 async def _build_chain_core(command_id: str, include_params: bool = True) -> Dict[str, Any]:
     step = await asyncio.to_thread(get_step_for_command, command_id)
     if not step:
@@ -255,13 +263,12 @@ async def _build_chain_core(command_id: str, include_params: bool = True) -> Dic
 
     return {"target_command_id": command_id, "chain": chain}
 
-
 @mcp.tool(description="Build prerequisite step chain for a selected command_id")
 async def build_chain_by_command_id(
     command_id: str,
     include_params: bool = True,
 
-    # --- n8n / agent служебные поля (ВАЖНО: добавить!) ---
+    # n8n / agent служебные поля — игнор
     id: Optional[str] = None,
     toolCallId: Optional[str] = None,
     tool: Optional[str] = None,
@@ -269,7 +276,6 @@ async def build_chain_by_command_id(
     action: Optional[str] = None,
     chatInput: Optional[str] = None,
 
-    # иногда используется snake_case в контексте — тоже можно принять
     session_id: Optional[str] = None,
     user_message: Optional[str] = None,
     state: Optional[str] = None,
@@ -281,9 +287,8 @@ async def build_chain_by_command_id(
     return await _build_chain_core(command_id=command_id, include_params=include_params)
 
 
-
 # =========================
-#PLAN
+# PLAN
 # =========================
 @mcp.tool(description="PLAN: keywords -> best command -> prerequisite step chain before executing that command")
 async def plan_from_keywords(
@@ -300,7 +305,6 @@ async def plan_from_keywords(
     toolCallId: Optional[str] = None,
     tool: Optional[str] = None,
 ):
-    # 1) normalize keywords
     if not keywords or (isinstance(keywords, list) and len(keywords) == 0):
         keywords = normalize_keywords(request) if request else []
     keywords = normalize_keywords(keywords)
@@ -309,7 +313,6 @@ async def plan_from_keywords(
     if not keywords:
         return {"keywords": [], "matched_command": None, "alternatives": [], "chain": []}
 
-    # 2) search by keywords
     rows = await asyncio.to_thread(fetch_commands_for_search)
     scored = await asyncio.to_thread(score_commands, rows, keywords)
     top = scored[:limit]
@@ -319,7 +322,6 @@ async def plan_from_keywords(
     idx = max(0, min(int(pick_index), len(top) - 1))
     matched = top[idx]
 
-    # 3) build chain only after command is selected
     chain_payload = await _build_chain_core(command_id=matched["command_id"], include_params=include_params)
 
     return {
@@ -330,15 +332,16 @@ async def plan_from_keywords(
         "chain_error": chain_payload.get("error"),
     }
 
+
 # =========================
 # SERVER START
 # =========================
 async def main(
     transport: Literal["http", "stdio", "sse"] = "http",
     host: str = "0.0.0.0",
-    port: int = 3344,
+    port: int = int(os.getenv("PORT", "8080")),
     path: str = "/mcp/",
-    allow_origins: List[str] = [],
+    allow_origins: Optional[List[str]] = None,
 ):
     middleware = [
         Middleware(
@@ -351,22 +354,18 @@ async def main(
 
     logger.info(f"Starting Neo4j MCP server on {host}:{port}{path} transport={transport}")
 
-    match transport:
-        case "http":
-            await mcp.run_http_async(host=host, port=port, path=path, middleware=middleware)
-        case "sse":
-            await mcp.run_http_async(host=host, port=port, path=path, middleware=middleware, transport="sse")
-        case "stdio":
-            await mcp.run_stdio_async()
-        case _:
-            raise ValueError(f"Unsupported transport: {transport}")
+    if transport == "http":
+        await mcp.run_http_async(host=host, port=port, path=path, middleware=middleware)
+    elif transport == "sse":
+        await mcp.run_http_async(host=host, port=port, path=path, middleware=middleware, transport="sse")
+    elif transport == "stdio":
+        await mcp.run_stdio_async()
+    else:
+        raise ValueError(f"Unsupported transport: {transport}")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     finally:
-        try:
-            driver.close()
-        except Exception:
-            pass
+        close_driver()
