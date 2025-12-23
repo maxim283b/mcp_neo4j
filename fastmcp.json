@@ -1,0 +1,20 @@
+{
+  "$schema": "https://gofastmcp.com/public/schemas/fastmcp.json/v1.json",
+  "source": {
+    "path": "server.py",
+    "entrypoint": "mcp"
+  },
+  "environment": {
+    "python": "3.11",
+    "dependencies": [
+      "fastmcp",
+      "neo4j",
+      "rapidfuzz",
+      "starlette"
+    ]
+  },
+  "deployment": {
+    "transport": "http",
+    "host": "0.0.0.0"
+  }
+}
