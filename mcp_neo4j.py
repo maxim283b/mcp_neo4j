@@ -67,10 +67,16 @@ def close_driver():
 # HELPERS
 # =========================
 def normalize_keywords(val: Any) -> List[str]:
+    """
+    Accept:
+      - ["a", "b"]
+      - "a,b"
+      - "a"
+    Return list of clean strings.
+    """
     if val is None:
         return []
     if isinstance(val, str):
-        # allow comma-separated
         return [v.strip() for v in val.split(",") if v.strip()]
     if isinstance(val, list):
         out: List[str] = []
@@ -78,7 +84,6 @@ def normalize_keywords(val: Any) -> List[str]:
             s = str(v).strip()
             if not s:
                 continue
-            # if some client sends items with commas inside
             out.extend([x.strip() for x in s.split(",") if x.strip()])
         return out
     s = str(val).strip()
@@ -99,20 +104,54 @@ def _run(query: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
         return [r.data() for r in s.run(query, params)]
 
 
-def _safe_float(x: Any) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
+def _tags_to_list(v: Any) -> List[str]:
+    """
+    Tags in DB can be:
+      - list
+      - string with '.' separated tokens
+      - string with ',' separated tokens
+    We normalize into list[str].
+    """
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x) for x in v if str(x).strip()]
+    s = str(v).strip()
+    if not s:
+        return []
+    # first split by '.' (your dataset uses dot-separated tags a lot)
+    parts = []
+    for chunk in s.split("."):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        # if inside chunk still comma-separated
+        parts.extend([x.strip() for x in chunk.split(",") if x.strip()])
+    return parts
+
+
+def _split_flags(v: Any) -> List[str]:
+    """
+    Your DB stores requires/Produces as STRING (often comma-separated),
+    but support list too.
+    """
+    if v is None:
+        return []
+    if isinstance(v, list):
+        out: List[str] = []
+        for x in v:
+            out.extend([t.strip() for t in str(x).split(",") if t.strip()])
+        return out
+    return [t.strip() for t in str(v).split(",") if t.strip()]
 
 
 # =========================
-# SEARCH (commands -> fuzzy)
+# SEARCH COMMANDS
 # =========================
 def fetch_commands_for_search() -> List[Dict[str, Any]]:
     """
     Collect searchable text for each command.
-    NOTE: relationships direction is: (steps)-[:has_command]->(commands)-[:has_params]->(Params)
+    Graph structure: (steps)-[:has_command]->(commands)-[:has_params]->(Params)
     """
     query = """
     MATCH (c:commands)
@@ -131,22 +170,14 @@ def fetch_commands_for_search() -> List[Dict[str, Any]]:
 
     rows: List[Dict[str, Any]] = []
     for r in _run(query, {}):
-        # Tags can be string or list depending on how data was loaded
-        def _tags(v: Any) -> List[str]:
-            if v is None:
-                return []
-            if isinstance(v, list):
-                return [str(x) for x in v if str(x).strip()]
-            return [x.strip() for x in str(v).split(".") if x.strip()]
-
         text = " ".join(
             [
                 str(r.get("command_desc") or ""),
                 str(r.get("step_desc") or ""),
                 str(r.get("param_desc") or ""),
-                *_tags(r.get("command_tags")),
-                *_tags(r.get("step_tags")),
-                *_tags(r.get("param_tags")),
+                *_tags_to_list(r.get("command_tags")),
+                *_tags_to_list(r.get("step_tags")),
+                *_tags_to_list(r.get("param_tags")),
             ]
         )
         rows.append(
@@ -172,8 +203,7 @@ def score_commands(rows: List[Dict[str, Any]], keywords: List[str]) -> List[Dict
             kw_l = kw.lower().strip()
             if not kw_l:
                 continue
-            score += _safe_float(fuzz.partial_ratio(kw_l, text))
-            # small boost for exact token match
+            score += float(fuzz.partial_ratio(kw_l, text))
             if kw_l in text.split():
                 score += 50.0
 
@@ -190,9 +220,14 @@ def score_commands(rows: List[Dict[str, Any]], keywords: List[str]) -> List[Dict
 async def search_commands(
     keywords: Optional[List[str]] = None,
     limit: int = 10,
-    # extra fields from n8n/clients ignored
+
+    # n8n / client fields ignored (explicitly declared; **kwargs NOT allowed in FastMCP Cloud)
     request: Optional[str] = None,
-    **_ignored,
+    sessionId: Optional[str] = None,
+    action: Optional[str] = None,
+    chatInput: Optional[str] = None,
+    toolCallId: Optional[str] = None,
+    tool: Optional[str] = None,
 ):
     if not keywords or (isinstance(keywords, list) and len(keywords) == 0):
         keywords = normalize_keywords(request) if request else []
@@ -219,10 +254,21 @@ def get_steps_for_command(command_id: str) -> List[Dict[str, Any]]:
     return _run(q, {"cid": command_id})
 
 
+def get_command_props(command_id: str) -> Dict[str, Any]:
+    q = """
+    MATCH (c:commands)
+    WHERE elementId(c) = $cid
+    RETURN properties(c) AS p
+    """
+    rows = _run(q, {"cid": command_id})
+    return (rows[0].get("p") if rows else {}) or {}
+
+
 def choose_best_step_for_command(command_id: str, command_props: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    If a command is linked to multiple steps, prefer the one whose s.Step matches command_props.Step.
-    Otherwise take the first.
+    If a command is linked to multiple steps:
+      - prefer step where step_props.Step == command_props.Step
+      - else return first
     """
     steps = get_steps_for_command(command_id)
     if not steps:
@@ -239,7 +285,8 @@ def choose_best_step_for_command(command_id: str, command_props: Dict[str, Any])
 
 def get_commands_for_step(step_id: str) -> List[Dict[str, Any]]:
     """
-    Return ALL commands for a step, with DISTINCT to avoid duplication when params exist.
+    Return ALL commands for the step.
+    Use DISTINCT to avoid duplication because of optional param joins.
     """
     q = """
     MATCH (s:steps)-[:has_command]->(c:commands)
@@ -261,23 +308,8 @@ def get_commands_for_step(step_id: str) -> List[Dict[str, Any]]:
 
 
 # =========================
-# PREREQUISITE CHAIN (requires/produces stored as STRING in your DB)
+# PREREQUISITE CHAIN (requires/Produces are STRING in your DB)
 # =========================
-def _split_flags(v: Any) -> List[str]:
-    """
-    DB stores requires/Produces as STRING (often comma-separated).
-    Support list too, just in case.
-    """
-    if v is None:
-        return []
-    if isinstance(v, list):
-        out: List[str] = []
-        for x in v:
-            out.extend([t.strip() for t in str(x).split(",") if t.strip()])
-        return out
-    return [t.strip() for t in str(v).split(",") if t.strip()]
-
-
 def get_requires(step_props: Dict[str, Any]) -> List[str]:
     req = step_props.get("requires")
     if req is None:
@@ -294,8 +326,7 @@ def get_produces(step_props: Dict[str, Any]) -> List[str]:
 
 def get_producers(flag: str) -> List[Dict[str, Any]]:
     """
-    IMPORTANT: Produces is stored as STRING in your DB.
-    Convert to list in Cypher so matching works.
+    Convert Produces/produses fields to list in Cypher because in your DB they are STRING.
     """
     q = """
     MATCH (s:steps)
@@ -318,7 +349,8 @@ def get_producers(flag: str) -> List[Dict[str, Any]]:
 
 def build_chain(step_id: str, step_props: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
     """
-    DFS over requires -> producers(flag). Works even if requires/Produces are STRING.
+    DFS over: step.requires -> producer steps that produce that flag.
+    Produces/requires stored as STRING is supported.
     """
     visited = set()
     ordered: List[Tuple[str, Dict[str, Any]]] = []
@@ -338,17 +370,8 @@ def build_chain(step_id: str, step_props: Dict[str, Any]) -> List[Tuple[str, Dic
     return ordered
 
 
-async def _build_chain_core(
-    command_id: str,
-    include_params: bool = True,
-) -> Dict[str, Any]:
-    # Need command_props to choose proper step if multiple
-    cmd_props_rows = _run(
-        "MATCH (c:commands) WHERE elementId(c) = $cid RETURN properties(c) AS p",
-        {"cid": command_id},
-    )
-    command_props = (cmd_props_rows[0]["p"] if cmd_props_rows else {}) or {}
-
+async def _build_chain_core(command_id: str, include_params: bool = True) -> Dict[str, Any]:
+    command_props = await asyncio.to_thread(get_command_props, command_id)
     step = await asyncio.to_thread(choose_best_step_for_command, command_id, command_props)
     if not step:
         return {"error": f"Step not found for command_id={command_id}", "chain": []}
@@ -369,13 +392,28 @@ async def _build_chain_core(
 async def build_chain_by_command_id(
     command_id: str,
     include_params: bool = True,
-    **_ignored,
+
+    # ignored
+    id: Optional[str] = None,
+    toolCallId: Optional[str] = None,
+    tool: Optional[str] = None,
+    sessionId: Optional[str] = None,
+    action: Optional[str] = None,
+    chatInput: Optional[str] = None,
+
+    session_id: Optional[str] = None,
+    user_message: Optional[str] = None,
+    state: Optional[str] = None,
+    params: Optional[dict] = None,
+    chain: Optional[Any] = None,
+    matched_command: Optional[Any] = None,
+    timestamp: Optional[str] = None,
 ):
     return await _build_chain_core(command_id=command_id, include_params=include_params)
 
 
 # =========================
-# PLAN (single intent, legacy)
+# PLAN (single intent)
 # =========================
 @mcp.tool(description="PLAN (single): keywords -> best command -> prerequisite step chain")
 async def plan_from_keywords(
@@ -383,8 +421,14 @@ async def plan_from_keywords(
     limit: int = 5,
     pick_index: int = 0,
     include_params: bool = True,
+
+    # ignored
     request: Optional[str] = None,
-    **_ignored,
+    sessionId: Optional[str] = None,
+    action: Optional[str] = None,
+    chatInput: Optional[str] = None,
+    toolCallId: Optional[str] = None,
+    tool: Optional[str] = None,
 ):
     if not keywords or (isinstance(keywords, list) and len(keywords) == 0):
         keywords = normalize_keywords(request) if request else []
@@ -403,10 +447,7 @@ async def plan_from_keywords(
     idx = max(0, min(int(pick_index), len(top) - 1))
     matched = top[idx]
 
-    chain_payload = await _build_chain_core(
-        command_id=matched["command_id"],
-        include_params=include_params,
-    )
+    chain_payload = await _build_chain_core(command_id=matched["command_id"], include_params=include_params)
 
     return {
         "keywords": keywords,
@@ -418,15 +459,21 @@ async def plan_from_keywords(
 
 
 # =========================
-# PLAN (multi-intent, recommended)
+# PLAN (multi-intent) — RECOMMENDED
 # =========================
 @mcp.tool(description="PLAN (multi-intent): build chains for each keyword phrase and merge steps")
 async def plan_multi_from_keywords(
     keywords: Optional[List[str]] = None,
     per_keyword_limit: int = 3,
     include_params: bool = True,
+
+    # ignored
     request: Optional[str] = None,
-    **_ignored,
+    sessionId: Optional[str] = None,
+    action: Optional[str] = None,
+    chatInput: Optional[str] = None,
+    toolCallId: Optional[str] = None,
+    tool: Optional[str] = None,
 ):
     if not keywords or (isinstance(keywords, list) and len(keywords) == 0):
         keywords = normalize_keywords(request) if request else []
@@ -439,7 +486,7 @@ async def plan_multi_from_keywords(
     rows = await asyncio.to_thread(fetch_commands_for_search)
 
     plans: List[Dict[str, Any]] = []
-    merged_by_step: Dict[str, Dict[str, Any]] = {}  # step_id -> step payload
+    merged_by_step: Dict[str, Dict[str, Any]] = {}
     merged_order: List[str] = []
 
     for kw in keywords:
@@ -450,21 +497,25 @@ async def plan_multi_from_keywords(
             continue
 
         matched = top[0]
-        chain_payload = await _build_chain_core(
-            command_id=matched["command_id"],
-            include_params=include_params,
-        )
+        chain_payload = await _build_chain_core(command_id=matched["command_id"], include_params=include_params)
         chain = chain_payload.get("chain", []) or []
-        plans.append({"keyword": kw, "matched": matched, "alternatives": top, "chain": chain})
 
-        # merge by step_id, keep first-seen order
+        plans.append(
+            {
+                "keyword": kw,
+                "matched": matched,
+                "alternatives": top,
+                "chain": chain,
+                "chain_error": chain_payload.get("error"),
+            }
+        )
+
         for step in chain:
             sid = step["step_id"]
             if sid not in merged_by_step:
                 merged_by_step[sid] = step
                 merged_order.append(sid)
             else:
-                # merge commands (avoid duplicates)
                 existing = merged_by_step[sid]
                 have = {c["command_id"] for c in existing.get("commands", [])}
                 for c in step.get("commands", []) or []:
@@ -473,18 +524,24 @@ async def plan_multi_from_keywords(
 
     merged_chain = [merged_by_step[sid] for sid in merged_order]
 
-    return {
-        "keywords": keywords,
-        "plans": plans,
-        "merged_chain": merged_chain,
-    }
+    return {"keywords": keywords, "plans": plans, "merged_chain": merged_chain}
 
 
 # =========================
-# OPTIONAL: graph sanity tool
+# DEBUG TOOL
 # =========================
 @mcp.tool(description="Debug: show types/values of requires/Produces for steps")
-async def debug_steps_requires_produces(limit: int = 50, **_ignored):
+async def debug_steps_requires_produces(
+    limit: int = 50,
+
+    # ignored
+    request: Optional[str] = None,
+    sessionId: Optional[str] = None,
+    action: Optional[str] = None,
+    chatInput: Optional[str] = None,
+    toolCallId: Optional[str] = None,
+    tool: Optional[str] = None,
+):
     limit = normalize_limit(limit, default=50)
     q = f"""
     MATCH (s:steps)
