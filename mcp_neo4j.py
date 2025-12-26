@@ -47,7 +47,7 @@ def get_driver() -> Driver:
     if not password:
         raise RuntimeError("Missing env var: NEO4J_PASSWORD")
 
-    # IMPORTANT: do NOT test connection here (no session.run on init)
+    # IMPORTANT: do NOT verify connectivity / do NOT run queries here.
     _driver = GraphDatabase.driver(uri, auth=(user, password))
     logger.info("Neo4j driver initialized (lazy)")
     return _driver
@@ -119,13 +119,11 @@ def _tags_to_list(v: Any) -> List[str]:
     s = str(v).strip()
     if not s:
         return []
-    # first split by '.' (your dataset uses dot-separated tags a lot)
-    parts = []
+    parts: List[str] = []
     for chunk in s.split("."):
         chunk = chunk.strip()
         if not chunk:
             continue
-        # if inside chunk still comma-separated
         parts.extend([x.strip() for x in chunk.split(",") if x.strip()])
     return parts
 
@@ -146,12 +144,12 @@ def _split_flags(v: Any) -> List[str]:
 
 
 # =========================
-# SEARCH COMMANDS
+# SEARCH COMMANDS (tool #1)
 # =========================
 def fetch_commands_for_search() -> List[Dict[str, Any]]:
     """
     Collect searchable text for each command.
-    Graph structure: (steps)-[:has_command]->(commands)-[:has_params]->(Params)
+    Graph: (steps)-[:has_command]->(commands)-[:has_params]->(Params)
     """
     query = """
     MATCH (c:commands)
@@ -216,12 +214,12 @@ def score_commands(rows: List[Dict[str, Any]], keywords: List[str]) -> List[Dict
     return out
 
 
-@mcp.tool(description="Search commands by keywords")
-async def search_commands(
+@mcp.tool(description="Search commands by keywords (fuzzy)")
+async def search_command(
     keywords: Optional[List[str]] = None,
     limit: int = 10,
 
-    # n8n / client fields ignored (explicitly declared; **kwargs NOT allowed in FastMCP Cloud)
+    # n8n / client fields ignored (explicit; **kwargs NOT allowed)
     request: Optional[str] = None,
     sessionId: Optional[str] = None,
     action: Optional[str] = None,
@@ -239,21 +237,13 @@ async def search_commands(
 
     rows = await asyncio.to_thread(fetch_commands_for_search)
     scored = await asyncio.to_thread(score_commands, rows, keywords)
+
     return {"keywords": keywords, "matched_commands": scored[:limit]}
 
 
 # =========================
-# STEP/COMMAND RESOLUTION
+# BUILD CHAIN (tool #2)
 # =========================
-def get_steps_for_command(command_id: str) -> List[Dict[str, Any]]:
-    q = """
-    MATCH (s:steps)-[:has_command]->(c:commands)
-    WHERE elementId(c) = $cid
-    RETURN elementId(s) AS step_id, properties(s) AS step_props
-    """
-    return _run(q, {"cid": command_id})
-
-
 def get_command_props(command_id: str) -> Dict[str, Any]:
     q = """
     MATCH (c:commands)
@@ -264,11 +254,20 @@ def get_command_props(command_id: str) -> Dict[str, Any]:
     return (rows[0].get("p") if rows else {}) or {}
 
 
+def get_steps_for_command(command_id: str) -> List[Dict[str, Any]]:
+    q = """
+    MATCH (s:steps)-[:has_command]->(c:commands)
+    WHERE elementId(c) = $cid
+    RETURN elementId(s) AS step_id, properties(s) AS step_props
+    """
+    return _run(q, {"cid": command_id})
+
+
 def choose_best_step_for_command(command_id: str, command_props: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    If a command is linked to multiple steps:
+    If command linked to multiple steps:
       - prefer step where step_props.Step == command_props.Step
-      - else return first
+      - else first
     """
     steps = get_steps_for_command(command_id)
     if not steps:
@@ -285,8 +284,8 @@ def choose_best_step_for_command(command_id: str, command_props: Dict[str, Any])
 
 def get_commands_for_step(step_id: str) -> List[Dict[str, Any]]:
     """
-    Return ALL commands for the step.
-    Use DISTINCT to avoid duplication because of optional param joins.
+    Return ALL commands for a step + their params.
+    DISTINCT avoids duplicates due to optional joins.
     """
     q = """
     MATCH (s:steps)-[:has_command]->(c:commands)
@@ -307,9 +306,6 @@ def get_commands_for_step(step_id: str) -> List[Dict[str, Any]]:
     return rows
 
 
-# =========================
-# PREREQUISITE CHAIN (requires/Produces are STRING in your DB)
-# =========================
 def get_requires(step_props: Dict[str, Any]) -> List[str]:
     req = step_props.get("requires")
     if req is None:
@@ -317,16 +313,9 @@ def get_requires(step_props: Dict[str, Any]) -> List[str]:
     return _split_flags(req)
 
 
-def get_produces(step_props: Dict[str, Any]) -> List[str]:
-    prod = step_props.get("Produces")
-    if prod is None:
-        prod = step_props.get("produces")
-    return _split_flags(prod)
-
-
 def get_producers(flag: str) -> List[Dict[str, Any]]:
     """
-    Convert Produces/produses fields to list in Cypher because in your DB they are STRING.
+    Produces/produses are STRING in your DB -> convert to list in Cypher.
     """
     q = """
     MATCH (s:steps)
@@ -349,8 +338,8 @@ def get_producers(flag: str) -> List[Dict[str, Any]]:
 
 def build_chain(step_id: str, step_props: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
     """
-    DFS over: step.requires -> producer steps that produce that flag.
-    Produces/requires stored as STRING is supported.
+    DFS: step.requires -> producers(flag)
+    Output is topologically ordered prerequisites, ending with target step.
     """
     visited = set()
     ordered: List[Tuple[str, Dict[str, Any]]] = []
@@ -370,9 +359,9 @@ def build_chain(step_id: str, step_props: Dict[str, Any]) -> List[Tuple[str, Dic
     return ordered
 
 
-async def _build_chain_core(command_id: str, include_params: bool = True) -> Dict[str, Any]:
-    command_props = await asyncio.to_thread(get_command_props, command_id)
-    step = await asyncio.to_thread(choose_best_step_for_command, command_id, command_props)
+async def _build_chain_for_command(command_id: str, include_params: bool) -> Dict[str, Any]:
+    cmd_props = await asyncio.to_thread(get_command_props, command_id)
+    step = await asyncio.to_thread(choose_best_step_for_command, command_id, cmd_props)
     if not step:
         return {"error": f"Step not found for command_id={command_id}", "chain": []}
 
@@ -385,11 +374,11 @@ async def _build_chain_core(command_id: str, include_params: bool = True) -> Dic
             cmds = [{"command_id": c["command_id"], "command_props": c["command_props"]} for c in cmds]
         chain.append({"step_id": sid, "step_props": sprops, "commands": cmds})
 
-    return {"target_command_id": command_id, "chain": chain}
+    return {"target_command_id": command_id, "target_step_id": step["step_id"], "chain": chain}
 
 
-@mcp.tool(description="Build prerequisite step chain for a selected command_id")
-async def build_chain_by_command_id(
+@mcp.tool(description="Build prerequisite step chain for a selected command_id (includes all commands in each step)")
+async def build_chain(
     command_id: str,
     include_params: bool = True,
 
@@ -409,126 +398,11 @@ async def build_chain_by_command_id(
     matched_command: Optional[Any] = None,
     timestamp: Optional[str] = None,
 ):
-    return await _build_chain_core(command_id=command_id, include_params=include_params)
+    return await _build_chain_for_command(command_id=command_id, include_params=include_params)
 
 
 # =========================
-# PLAN (single intent)
-# =========================
-@mcp.tool(description="PLAN (single): keywords -> best command -> prerequisite step chain")
-async def plan_from_keywords(
-    keywords: Optional[List[str]] = None,
-    limit: int = 5,
-    pick_index: int = 0,
-    include_params: bool = True,
-
-    # ignored
-    request: Optional[str] = None,
-    sessionId: Optional[str] = None,
-    action: Optional[str] = None,
-    chatInput: Optional[str] = None,
-    toolCallId: Optional[str] = None,
-    tool: Optional[str] = None,
-):
-    if not keywords or (isinstance(keywords, list) and len(keywords) == 0):
-        keywords = normalize_keywords(request) if request else []
-    keywords = normalize_keywords(keywords)
-    limit = normalize_limit(limit, default=5)
-
-    if not keywords:
-        return {"keywords": [], "matched_command": None, "alternatives": [], "chain": []}
-
-    rows = await asyncio.to_thread(fetch_commands_for_search)
-    scored = await asyncio.to_thread(score_commands, rows, keywords)
-    top = scored[:limit]
-    if not top:
-        return {"keywords": keywords, "matched_command": None, "alternatives": [], "chain": []}
-
-    idx = max(0, min(int(pick_index), len(top) - 1))
-    matched = top[idx]
-
-    chain_payload = await _build_chain_core(command_id=matched["command_id"], include_params=include_params)
-
-    return {
-        "keywords": keywords,
-        "matched_command": matched,
-        "alternatives": top,
-        "chain": chain_payload.get("chain", []),
-        "chain_error": chain_payload.get("error"),
-    }
-
-
-# =========================
-# PLAN (multi-intent) — RECOMMENDED
-# =========================
-@mcp.tool(description="PLAN (multi-intent): build chains for each keyword phrase and merge steps")
-async def plan_multi_from_keywords(
-    keywords: Optional[List[str]] = None,
-    per_keyword_limit: int = 3,
-    include_params: bool = True,
-
-    # ignored
-    request: Optional[str] = None,
-    sessionId: Optional[str] = None,
-    action: Optional[str] = None,
-    chatInput: Optional[str] = None,
-    toolCallId: Optional[str] = None,
-    tool: Optional[str] = None,
-):
-    if not keywords or (isinstance(keywords, list) and len(keywords) == 0):
-        keywords = normalize_keywords(request) if request else []
-    keywords = normalize_keywords(keywords)
-
-    if not keywords:
-        return {"keywords": [], "plans": [], "merged_chain": []}
-
-    per_keyword_limit = normalize_limit(per_keyword_limit, default=3)
-    rows = await asyncio.to_thread(fetch_commands_for_search)
-
-    plans: List[Dict[str, Any]] = []
-    merged_by_step: Dict[str, Dict[str, Any]] = {}
-    merged_order: List[str] = []
-
-    for kw in keywords:
-        scored = await asyncio.to_thread(score_commands, rows, [kw])
-        top = scored[:per_keyword_limit]
-        if not top:
-            plans.append({"keyword": kw, "matched": None, "alternatives": [], "chain": []})
-            continue
-
-        matched = top[0]
-        chain_payload = await _build_chain_core(command_id=matched["command_id"], include_params=include_params)
-        chain = chain_payload.get("chain", []) or []
-
-        plans.append(
-            {
-                "keyword": kw,
-                "matched": matched,
-                "alternatives": top,
-                "chain": chain,
-                "chain_error": chain_payload.get("error"),
-            }
-        )
-
-        for step in chain:
-            sid = step["step_id"]
-            if sid not in merged_by_step:
-                merged_by_step[sid] = step
-                merged_order.append(sid)
-            else:
-                existing = merged_by_step[sid]
-                have = {c["command_id"] for c in existing.get("commands", [])}
-                for c in step.get("commands", []) or []:
-                    if c["command_id"] not in have:
-                        existing["commands"].append(c)
-
-    merged_chain = [merged_by_step[sid] for sid in merged_order]
-
-    return {"keywords": keywords, "plans": plans, "merged_chain": merged_chain}
-
-
-# =========================
-# DEBUG TOOL
+# DEBUGGER (tool #3)
 # =========================
 @mcp.tool(description="Debug: show types/values of requires/Produces for steps")
 async def debug_steps_requires_produces(
