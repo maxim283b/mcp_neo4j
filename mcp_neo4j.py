@@ -18,13 +18,13 @@ logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler())
 
 # =========================
-# MCP (MUST be top-level)
+# MCP
 # =========================
 mcp = FastMCP("neo4j-mcp")
 logger.info("MCP server object created")
 
 # =========================
-# NEO4J (LAZY INIT — NO NETWORK ON IMPORT)
+# NEO4J 
 # =========================
 _driver: Optional[Driver] = None
 
@@ -144,7 +144,7 @@ def _split_flags(v: Any) -> List[str]:
 
 
 # =========================
-# SEARCH COMMANDS (tool #1)
+# SEARCH COMMANDS 
 # =========================
 def fetch_commands_for_search() -> List[Dict[str, Any]]:
     """
@@ -242,7 +242,7 @@ async def search_command(
 
 
 # =========================
-# BUILD CHAIN (tool #2)
+# BUILD CHAIN
 # =========================
 def get_command_props(command_id: str) -> Dict[str, Any]:
     q = """
@@ -402,7 +402,7 @@ async def build_chain(
 
 
 # =========================
-# DEBUGGER (tool #3)
+# DEBUGGER
 # =========================
 @mcp.tool(description="Debug: show types/values of requires/Produces for steps")
 async def debug_steps_requires_produces(
