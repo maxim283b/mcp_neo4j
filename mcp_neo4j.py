@@ -365,7 +365,7 @@ async def _build_step_chain_for_command(command_id: str, include_params: bool) -
     if not step:
         return {"error": f"Step not found for command_id={command_id}", "chain": []}
 
-    chain_steps = await asyncio.to_thread(build_chain, step["step_id"], step["step_props"])
+    chain_steps = await asyncio.to_thread(build_step_chain, step["step_id"], step["step_props"])
 
     chain: List[Dict[str, Any]] = []
     for sid, sprops in chain_steps:
@@ -398,7 +398,7 @@ async def build_chain(
     matched_command: Optional[Any] = None,
     timestamp: Optional[str] = None,
 ):
-    return await _build_chain_for_command(command_id=command_id, include_params=include_params)
+    return await _build_step_chain_for_command(command_id=command_id, include_params=include_params)
 
 
 # =========================
