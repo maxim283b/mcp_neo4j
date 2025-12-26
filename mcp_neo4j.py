@@ -336,7 +336,7 @@ def get_producers(flag: str) -> List[Dict[str, Any]]:
     return _run(q, {"flag": flag})
 
 
-def build_chain(step_id: str, step_props: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+def build_step_chain(step_id: str, step_props: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
     """
     DFS: step.requires -> producers(flag)
     Output is topologically ordered prerequisites, ending with target step.
