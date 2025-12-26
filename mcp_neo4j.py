@@ -359,7 +359,7 @@ def build_step_chain(step_id: str, step_props: Dict[str, Any]) -> List[Tuple[str
     return ordered
 
 
-async def _build_chain_for_command(command_id: str, include_params: bool) -> Dict[str, Any]:
+async def _build_step_chain_for_command(command_id: str, include_params: bool) -> Dict[str, Any]:
     cmd_props = await asyncio.to_thread(get_command_props, command_id)
     step = await asyncio.to_thread(choose_best_step_for_command, command_id, cmd_props)
     if not step:
